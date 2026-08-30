@@ -31,10 +31,13 @@ OUT_XLSX = "tokyo_1houjin_1kyotaku.xlsx"
 # 事業所の基本情報（当初ご指定の並び順を維持し、代表者名・管理者名・エリアを追加）
 BASE_COLS = [
     "No", "エリア",
-    "法人名", "代表者名", "管理者名", "法人所在地",
+    "法人番号", "法人名", "代表者名", "管理者名", "法人所在地",
     "事業所名", "事業所番号", "事業所所在地",
-    "電話番号", "FAX", "ホームページ", "指定年月日",
+    "電話番号", "FAX", "ホームページ", "利用可能曜日", "指定年月日",
 ]
+
+# 元データに無くても残す列（架電時に手で埋めるため）
+KEEP_IF_EMPTY = {"代表者名", "管理者名", "指定年月日"}
 
 # 架電時に記入する項目（空欄で出力）
 CALL_COLS = [
@@ -124,13 +127,21 @@ def pick_all(cols, pattern, exclude=()):
 
 
 def join_parts(df, cols):
-    """住所が都道府県/市区町村/番地/建物名に分割されている場合に連結する。"""
+    """住所が都道府県/市区町村/番地/建物名に分割されている場合に連結する。
+
+    方書（ビル名等）が住所側に既に含まれている形式のデータがあるため、
+    既出の部分は連結せず読み飛ばす。
+    """
     if not cols:
         return pd.Series([""] * len(df), index=df.index)
-    s = df[cols[0]].fillna("")
+    acc = df[cols[0]].fillna("").astype(str).str.strip()
     for c in cols[1:]:
-        s = s.str.cat(df[c].fillna(""), sep="")
-    return s.str.strip()
+        part = df[c].fillna("").astype(str).str.strip()
+        acc = pd.Series(
+            [a if (not p or p in a) else a + p for a, p in zip(acc, part)],
+            index=acc.index,
+        )
+    return acc.str.strip()
 
 
 def resolve_columns(df):
@@ -153,6 +164,9 @@ def resolve_columns(df):
         [r"管理者.*氏名", r"管理者名", r"事業所.*管理者"],
         exclude=KANA_EXCL + (r"職名", r"役職", r"経歴"),
     )
+    m["法人番号"] = pick(cols, [r"^法人番号$", r"法人番号"], exclude=(r"コード",))
+    m["利用可能曜日"] = pick(cols, [r"^利用可能曜日$", r"利用可能曜日"],
+                        exclude=(r"特記",))
     m["事業所名"] = pick(cols, [r"事業所.*名称", r"事業所名"], exclude=KANA_EXCL)
     m["事業所番号"] = pick(cols, [r"事業所番号", r"事業所.*番号"])
     m["電話番号"] = pick(cols, [r"事業所.*電話", r"電話番号", r"電話"])
@@ -173,9 +187,16 @@ def resolve_columns(df):
 
     jigyo_addr = pick_all(cols, r"事業所所在地", exclude=KANA_EXCL + (r"コード",))
     if not jigyo_addr:
-        c = pick(cols, [r"事業所.*所在地", r"事業所.*住所", r"所在地"],
+        # 「住所」＋「方書（ビル名等）」のように分かれている形式にも対応
+        jigyo_addr = []
+        c = pick(cols, [r"^住所$", r"事業所.*所在地", r"事業所.*住所",
+                        r"所在地", r"住所"],
                  exclude=KANA_EXCL + (r"法人", r"コード"))
-        jigyo_addr = [c] if c else []
+        if c:
+            jigyo_addr.append(c)
+        b = pick(cols, [r"方書", r"建物名", r"ビル名"], exclude=KANA_EXCL)
+        if b:
+            jigyo_addr.append(b)
     m["_事業所所在地_列"] = jigyo_addr
 
     m["_都道府県"] = pick(
@@ -186,7 +207,8 @@ def resolve_columns(df):
     # エリア（区市町村）専用列があれば最優先で使う
     m["_市区町村"] = pick(
         cols,
-        [r"事業所所在地.*市区町村", r"事業所所在地.*市町村", r"^市区町村$"],
+        [r"事業所所在地.*市区町村", r"事業所所在地.*市町村",
+         r"^市区町村名$", r"^市区町村$", r"市区町村名", r"市町村名"],
         exclude=(r"コード", r"法人"),
     )
     return m
@@ -340,6 +362,7 @@ def main():
                 if c else pd.Series([""] * len(df), index=df.index))
 
     out = pd.DataFrame(index=df.index)
+    out["法人番号"] = col("法人番号")
     out["法人名"] = col("法人名")
     out["代表者名"] = col("代表者名")
     out["管理者名"] = col("管理者名")
@@ -347,12 +370,12 @@ def main():
     out["事業所名"] = col("事業所名")
     out["事業所番号"] = col("事業所番号")
     out["事業所所在地"] = join_parts(df, m["_事業所所在地_列"])
-    for k in ("電話番号", "FAX", "ホームページ", "指定年月日"):
+    for k in ("電話番号", "FAX", "ホームページ", "利用可能曜日", "指定年月日"):
         out[k] = col(k)
 
     # 元データに無かった列を報告
-    for label in ("代表者名", "管理者名", "電話番号", "FAX",
-                  "ホームページ", "指定年月日"):
+    for label in ("法人番号", "代表者名", "管理者名", "電話番号", "FAX",
+                  "ホームページ", "利用可能曜日", "指定年月日"):
         if not m.get(label):
             print(f"  ※ 注意: 「{label}」に対応する列が元データに見つからず、"
                   f"空欄で出力します")
@@ -386,7 +409,18 @@ def main():
         print("エリアの取得元: 事業所所在地から切り出し")
 
     # ---- 4. 法人名＋法人所在地でグルーピング ---------------------------
-    key = tokyo["法人名"].map(normalize) + "|" + tokyo["法人所在地"].map(normalize)
+    # 法人番号があればそれが最も正確な同一法人の判定。
+    # 空欄の行だけ、法人名＋法人所在地の正規化キーで補う。
+    name_key = (
+        "名:" + tokyo["法人名"].map(normalize)
+        + "|" + tokyo["法人所在地"].map(normalize)
+    )
+    hojin_no = tokyo["法人番号"].map(normalize)
+    key = hojin_no.where(hojin_no == "", "番:" + hojin_no)
+    key = key.mask(hojin_no == "", name_key)
+    n_no = int((hojin_no != "").sum())
+    print(f"法人の名寄せキー: 法人番号 {n_no:,}件 / "
+          f"法人名＋法人所在地 {len(tokyo) - n_no:,}件")
     target = tokyo[key.map(key.value_counts()) == 1].copy()
 
     # ---- 並べ替え・列整形 ----------------------------------------------
@@ -396,7 +430,11 @@ def main():
         d = d.sort_values(["_k", "法人名", "事業所名"]).drop(columns="_k")
         d = d.reset_index(drop=True)
         d.insert(0, "No", range(1, len(d) + 1))
-        cols = list(BASE_COLS)
+        cols = [
+            c for c in BASE_COLS
+            if c in KEEP_IF_EMPTY or c in ("No", "エリア")
+            or d[c].astype(str).str.strip().ne("").any()
+        ]
         if with_call:
             for c in CALL_COLS:
                 d[c] = ""
