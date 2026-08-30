@@ -27,9 +27,8 @@ CSV_URL = (
 )
 DEFAULT_CSV = "jigyosho_430_all.csv"
 OUT_XLSX = "tokyo_1houjin_1kyotaku.xlsx"
-OUT_CSV_MINKAN = "tokyo_minkan_1jigyosho.csv"
-OUT_CSV_MINKAN_STRICT = "tokyo_minkan_1jigyosho_zenkoku.csv"
-OUT_CSV_UNKNOWN = "tokyo_shubetsu_fumei.csv"
+OUT_CSV_LIST = "tokyo_minkan_1jigyosho.csv"     # 最終の架電リスト
+OUT_CSV_EXCLUDED = "tokyo_jogai.csv"            # 除外した行と理由
 
 # 事業所の基本情報（当初ご指定の並び順を維持し、代表者名・管理者名・エリアを追加）
 BASE_COLS = [
@@ -37,7 +36,7 @@ BASE_COLS = [
     "法人種別", "都内事業所数", "全国事業所数", "事業所タイプ(推定)",
     "法人番号", "法人名", "代表者名", "管理者名", "法人所在地",
     "事業所名", "事業所番号", "事業所所在地",
-    "電話番号", "電話番号(整形)", "FAX", "ホームページ",
+    "電話番号", "電話番号(整形)", "電話種別", "FAX", "ホームページ",
     "利用可能曜日", "指定年月日",
 ]
 
@@ -272,6 +271,44 @@ def normalize(s):
 
 
 # --------------------------------------------------------------------------
+# 架電リストからの除外条件（マーケティング上の理由）
+# --------------------------------------------------------------------------
+# 東京都の島嶼部。訪問できず架電効率も悪いため対象外にする。
+ISLANDS = ["大島町", "利島村", "新島村", "神津島村", "三宅村",
+           "御蔵島村", "八丈町", "青ヶ島村", "小笠原村"]
+
+
+def phone_kind(p):
+    """架電時の当たり方が変わるので電話番号の種類を分けておく。"""
+    d = re.sub(r"\D", "", str(p or ""))
+    if d.startswith(("090", "080", "070")):
+        return "携帯"
+    if d.startswith("050"):
+        return "IP電話"
+    if d.startswith("03"):
+        return "固定(23区)"
+    return "固定(多摩等)" if d else ""
+
+
+def exclusion_reasons(d):
+    """各行の除外理由を組み立てる。理由が空の行が架電対象。"""
+    reasons = [[] for _ in range(len(d))]
+    idx = {k: i for i, k in enumerate(d.index)}
+
+    def mark(mask, label):
+        for k in d.index[mask]:
+            reasons[idx[k]].append(label)
+
+    mark(d["事業所タイプ(推定)"] != "独立系", "併設事業所")
+    mark(d["全国1事業所"] != "○", "他県にも拠点あり")
+    mark(d["エリア"].isin(ISLANDS), "島嶼部")
+    # 同じ番号への二重架電を防ぐため、2件目以降を落とす
+    dg = d["電話番号(整形)"].map(lambda s: re.sub(r"\D", "", str(s)))
+    mark(dg.duplicated(keep="first") & dg.ne(""), "電話番号が他社と重複")
+    return pd.Series([" / ".join(r) for r in reasons], index=d.index)
+
+
+# --------------------------------------------------------------------------
 # 法人種別の判定
 # --------------------------------------------------------------------------
 # 法人名から法人格を判定する。上から順に評価するので、非営利・公的なものを
@@ -467,13 +504,13 @@ def style_sheet(ws, df, with_call_cols):
             ws.cell(r, cols.index(col_name) + 1).number_format = "yyyy/m/d"
 
 
-def write_excel(path, full, target, strict, minkan, unknown,
+def write_excel(path, full, target, strict, call_list, excluded,
                 summary, areas, audit):
     used = set()
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         sheets = [
-            ("民間1事業所(架電用)", minkan, True),
-            ("種別不明_要確認", unknown, True),
+            ("架電リスト(最終)", call_list, True),
+            ("除外リスト", excluded, False),
             ("1法人1事業所(都内)", target, True),
             ("1法人1事業所(全国)", strict, True),
             ("架電リスト(全件)", full, True),
@@ -520,6 +557,7 @@ def main():
         out[k] = col(k)
     out["電話番号(整形)"] = out["電話番号"].map(normalize_phone)
     out["事業所タイプ(推定)"] = out["事業所名"].map(facility_type)
+    out["電話種別"] = out["電話番号(整形)"].map(phone_kind)
     # 法人格は名称に書かれていないことがある。同じ法人番号の行が全国に
     # あれば、そちらの名称に法人格が書かれている場合があるので突き合わせる。
     # 例: 東京の行が「杉の子」でも、他県の行が「社会福祉法人　杉の子」。
@@ -641,18 +679,31 @@ def main():
     # 民間（営利法人）のみを切り出す。法人格が名称に無い行は判定できないため
     # 別枠にして、人が見て判断できるようにする。
     minkan = target[target["法人種別"].isin(MINKAN_TYPES)].copy()
-    unknown = target[target["法人種別"] == "不明(法人格の記載なし)"].copy()
+    minkan["除外理由"] = exclusion_reasons(minkan)
+    call_list = minkan[minkan["除外理由"] == ""].drop(columns="除外理由")
 
-    write_excel(OUT_XLSX, full, target, strict, minkan, unknown,
+    # 除外した行は理由つきで残す。法人格が名称に無く民間と判定できなかった
+    # 行もここにまとめる。
+    dropped = minkan[minkan["除外理由"] != ""].copy()
+    other = target[~target["法人種別"].isin(MINKAN_TYPES)].copy()
+    other["除外理由"] = "民間(営利法人)ではない: " + other["法人種別"]
+    excluded = pd.concat([dropped, other], ignore_index=True)
+    cols = [c for c in minkan.columns if c != "除外理由"]
+    excluded = excluded[["除外理由"] + cols]
+
+    print("\n  架電リストからの除外内訳:")
+    for label, n in (
+        minkan.loc[minkan["除外理由"] != "", "除外理由"]
+        .str.split(" / ").explode().value_counts().items()
+    ):
+        print(f"    {label:<20}: {n:>4} 件")
+
+    write_excel(OUT_XLSX, full, target, strict, call_list, excluded,
                 summary, areas, audit)
 
-    # CSVは架電リストをそのまま他ツールに取り込めるように出す。
+    # CSVは他ツールにそのまま取り込めるように出す。
     # Excelでそのまま開けるよう utf-8-sig（BOM付き）にする。
-    for path, d in (
-        (OUT_CSV_MINKAN, minkan),
-        (OUT_CSV_MINKAN_STRICT, minkan[minkan["全国1事業所"] == "○"]),
-        (OUT_CSV_UNKNOWN, unknown),
-    ):
+    for path, d in ((OUT_CSV_LIST, call_list), (OUT_CSV_EXCLUDED, excluded)):
         d.to_csv(path, index=False, encoding="utf-8-sig")
         print(f"  CSV出力: {path} ({len(d):,}件)")
 
