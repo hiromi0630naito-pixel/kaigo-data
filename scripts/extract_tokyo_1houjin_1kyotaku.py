@@ -27,11 +27,14 @@ CSV_URL = (
 )
 DEFAULT_CSV = "jigyosho_430_all.csv"
 OUT_XLSX = "tokyo_1houjin_1kyotaku.xlsx"
+OUT_CSV_MINKAN = "tokyo_minkan_1jigyosho.csv"
+OUT_CSV_MINKAN_STRICT = "tokyo_minkan_1jigyosho_zenkoku.csv"
+OUT_CSV_UNKNOWN = "tokyo_shubetsu_fumei.csv"
 
 # 事業所の基本情報（当初ご指定の並び順を維持し、代表者名・管理者名・エリアを追加）
 BASE_COLS = [
     "No", "エリア", "都内1事業所", "全国1事業所",
-    "都内事業所数", "全国事業所数", "事業所タイプ(推定)",
+    "法人種別", "都内事業所数", "全国事業所数", "事業所タイプ(推定)",
     "法人番号", "法人名", "代表者名", "管理者名", "法人所在地",
     "事業所名", "事業所番号", "事業所所在地",
     "電話番号", "電話番号(整形)", "FAX", "ホームページ",
@@ -41,20 +44,28 @@ BASE_COLS = [
 # 元データに無くても残す列（架電時に手で埋めるため）
 KEEP_IF_EMPTY = {"代表者名", "管理者名", "指定年月日"}
 
-# 架電時に記入する項目（空欄で出力）
+# 架電時に記入する項目（空欄で出力）。メモ以外はすべてプルダウンにする。
 CALL_COLS = [
-    "架電状況", "架電日", "架電回数", "担当者", "対応者(役職・氏名)",
-    "見込み度", "通話メモ", "次回アクション", "次回架電予定日", "備考",
+    "記録者", "架電状況", "架電日", "架電回数", "対応者", "見込み度",
+    "次回アクション", "次回架電予定日", "希望時間帯", "通話メモ", "備考",
 ]
 
-STATUS_CHOICES = [
-    "未着手", "アポ獲得", "追客中", "再架電", "不在", "折り返し待ち",
-    "受付ブロック", "興味なし", "番号違い", "対象外",
-]
-RANK_CHOICES = ["A(即アポ)", "B(見込みあり)", "C(長期)", "D(見込み薄)"]
+# 列名 -> プルダウンの選択肢
+CHOICES = {
+    "記録者": ["しょうちゃん", "さくや", "廣澤"],
+    "架電状況": ["未着手", "アポ獲得", "追客中", "再架電", "不在",
+              "折り返し待ち", "受付ブロック", "興味なし", "番号違い", "対象外"],
+    "架電回数": ["1", "2", "3", "4", "5回以上"],
+    "対応者": ["代表者", "管理者", "ケアマネ", "事務・受付", "その他", "不明"],
+    "見込み度": ["A(即アポ)", "B(見込みあり)", "C(長期)", "D(見込み薄)"],
+    "次回アクション": ["再架電", "資料送付", "メール送付", "訪問アポ", "対応不要"],
+    "希望時間帯": ["午前", "13-15時", "15-17時", "17時以降", "指定なし"],
+}
+# 日付として入力規則をかける列（プルダウンにはなじまないため）
+DATE_COLS = ["架電日", "次回架電予定日"]
 
-# 幅を広めに取りたい入力欄
-WIDE_COLS = {"通話メモ", "次回アクション", "備考"}
+# 幅を広めに取りたい自由入力欄
+WIDE_COLS = {"通話メモ", "備考"}
 
 HEADER_FILL_BASE = PatternFill("solid", fgColor="1F4E78")   # 濃紺: 基本情報
 HEADER_FILL_CALL = PatternFill("solid", fgColor="C55A11")   # 橙  : 架電記入欄
@@ -261,6 +272,37 @@ def normalize(s):
 
 
 # --------------------------------------------------------------------------
+# 法人種別の判定
+# --------------------------------------------------------------------------
+# 法人名から法人格を判定する。上から順に評価するので、非営利・公的なものを
+# 先に置き、営利法人は最後に判定する。
+CORP_RULES = [
+    ("公的機関", r"独立行政法人|国立(?!市)|日本赤十字社|^東京都|市役所|恩賜財団"),
+    ("社協", r"社会福祉協議会"),
+    ("社会福祉法人", r"社会福祉法人|シャカイフクシホウジン"),
+    ("医療法人", r"医療法人|医療法社団"),
+    ("公益法人", r"公益社団法人|公益財団法人"),
+    ("学校・宗教", r"学校法人|宗教法人"),
+    ("協同組合", r"協同組合"),
+    ("NPO", r"特定非営利活動法人|特定非営利法人|NPO|ＮＰＯ"),
+    ("一般社団・財団", r"一般社団法人|一般財団法人|社団法人|財団法人"),
+    ("営利法人", r"株式会社|有限会社|合同会社|合資会社|合名会社"
+               r"|\(株\)|（株）|\(有\)|（有）|㈱|㈲"),
+]
+# 民間企業として架電対象にする種別
+MINKAN_TYPES = {"営利法人"}
+
+
+def corp_type(name):
+    """法人名から法人種別を判定する。法人格が名称に無い場合は不明とする。"""
+    n = str(name or "")
+    for label, pat in CORP_RULES:
+        if re.search(pat, n):
+            return label
+    return "不明(法人格の記載なし)"
+
+
+# --------------------------------------------------------------------------
 # 事業所タイプの推定
 # --------------------------------------------------------------------------
 # このデータは全件が居宅介護支援の指定事業所だが、母体が病院や特養で、
@@ -392,28 +434,46 @@ def style_sheet(ws, df, with_call_cols):
     if not (with_call_cols and nrow):
         return
 
-    # 架電状況・見込み度にプルダウンを設定
-    for col_name, choices in (
-        ("架電状況", STATUS_CHOICES), ("見込み度", RANK_CHOICES),
-    ):
-        if col_name not in df.columns:
+    # メモ以外の入力欄はプルダウン、日付欄は日付の入力規則にする
+    cols = list(df.columns)
+    for col_name, choices in CHOICES.items():
+        if col_name not in cols:
             continue
-        idx = list(df.columns).index(col_name) + 1
-        letter = get_column_letter(idx)
+        letter = get_column_letter(cols.index(col_name) + 1)
         dv = DataValidation(
             type="list",
             formula1='"' + ",".join(choices) + '"',
             allow_blank=True,
             showDropDown=False,   # False で「ドロップダウンを表示する」がON
+            promptTitle=col_name,
+            prompt="リストから選択してください",
         )
         ws.add_data_validation(dv)
         dv.add(f"{letter}2:{letter}{nrow + 1}")
 
+    for col_name in DATE_COLS:
+        if col_name not in cols:
+            continue
+        letter = get_column_letter(cols.index(col_name) + 1)
+        dv = DataValidation(
+            type="date", operator="between",
+            formula1="DATE(2020,1,1)", formula2="DATE(2035,12,31)",
+            allow_blank=True,
+            promptTitle=col_name, prompt="日付を入力（例 2026/9/1）",
+        )
+        ws.add_data_validation(dv)
+        dv.add(f"{letter}2:{letter}{nrow + 1}")
+        for r in range(2, nrow + 2):
+            ws.cell(r, cols.index(col_name) + 1).number_format = "yyyy/m/d"
 
-def write_excel(path, full, target, strict, summary, areas, audit):
+
+def write_excel(path, full, target, strict, minkan, unknown,
+                summary, areas, audit):
     used = set()
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         sheets = [
+            ("民間1事業所(架電用)", minkan, True),
+            ("種別不明_要確認", unknown, True),
             ("1法人1事業所(都内)", target, True),
             ("1法人1事業所(全国)", strict, True),
             ("架電リスト(全件)", full, True),
@@ -460,6 +520,7 @@ def main():
         out[k] = col(k)
     out["電話番号(整形)"] = out["電話番号"].map(normalize_phone)
     out["事業所タイプ(推定)"] = out["事業所名"].map(facility_type)
+    out["法人種別"] = out["法人名"].map(corp_type)
 
     # 全国での事業所数。東京都で1事業所でも他県に拠点を持つ法人を見分ける。
     nat = out.loc[out["法人番号"] != "", "法人番号"].value_counts()
@@ -568,7 +629,23 @@ def main():
 
     # ---- 5. Excel 出力 --------------------------------------------------
     audit = phone_audit(full)
-    write_excel(OUT_XLSX, full, target, strict, summary, areas, audit)
+    # 民間（営利法人）のみを切り出す。法人格が名称に無い行は判定できないため
+    # 別枠にして、人が見て判断できるようにする。
+    minkan = target[target["法人種別"].isin(MINKAN_TYPES)].copy()
+    unknown = target[target["法人種別"] == "不明(法人格の記載なし)"].copy()
+
+    write_excel(OUT_XLSX, full, target, strict, minkan, unknown,
+                summary, areas, audit)
+
+    # CSVは架電リストをそのまま他ツールに取り込めるように出す。
+    # Excelでそのまま開けるよう utf-8-sig（BOM付き）にする。
+    for path, d in (
+        (OUT_CSV_MINKAN, minkan),
+        (OUT_CSV_MINKAN_STRICT, minkan[minkan["全国1事業所"] == "○"]),
+        (OUT_CSV_UNKNOWN, unknown),
+    ):
+        d.to_csv(path, index=False, encoding="utf-8-sig")
+        print(f"  CSV出力: {path} ({len(d):,}件)")
 
     # ---- 6. 報告 --------------------------------------------------------
     print()
@@ -578,6 +655,10 @@ def main():
     print(f"  うち独立系(併設でない)と推定  : "
           f"{int((strict['事業所タイプ(推定)'] == '独立系').sum()):,} 件")
     print(f"  ※都内1事業所だが他県に拠点あり: {len(target) - len(strict):,} 件")
+    print("\n  法人種別の内訳(都内1事業所):")
+    for k, v in target["法人種別"].value_counts().items():
+        mark = " ← 架電対象" if k in MINKAN_TYPES else ""
+        print(f"    {k:<20}: {v:>5} 件{mark}")
     print(f"エリア数                      : {len(areas)} 区市町村")
     print(f"電話番号 要確認                : {len(audit):,} 件"
           f"（数字自体の誤りではなく表記ゆれ等）")
