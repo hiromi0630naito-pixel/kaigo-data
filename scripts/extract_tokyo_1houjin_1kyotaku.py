@@ -520,7 +520,16 @@ def main():
         out[k] = col(k)
     out["電話番号(整形)"] = out["電話番号"].map(normalize_phone)
     out["事業所タイプ(推定)"] = out["事業所名"].map(facility_type)
-    out["法人種別"] = out["法人名"].map(corp_type)
+    # 法人格は名称に書かれていないことがある。同じ法人番号の行が全国に
+    # あれば、そちらの名称に法人格が書かれている場合があるので突き合わせる。
+    # 例: 東京の行が「杉の子」でも、他県の行が「社会福祉法人　杉の子」。
+    names_by_no = (
+        out.loc[out["法人番号"] != "", ["法人番号", "法人名"]]
+        .groupby("法人番号")["法人名"].apply(lambda v: " ".join(sorted(set(v))))
+    )
+    merged_name = out["法人番号"].map(names_by_no).fillna(out["法人名"])
+    out["法人種別"] = merged_name.where(
+        out["法人番号"] != "", out["法人名"]).map(corp_type)
 
     # 全国での事業所数。東京都で1事業所でも他県に拠点を持つ法人を見分ける。
     nat = out.loc[out["法人番号"] != "", "法人番号"].value_counts()
