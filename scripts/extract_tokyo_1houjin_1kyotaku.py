@@ -30,7 +30,7 @@ OUT_XLSX = "tokyo_1houjin_1kyotaku.xlsx"
 
 # 事業所の基本情報（当初ご指定の並び順を維持し、代表者名・管理者名・エリアを追加）
 BASE_COLS = [
-    "No", "エリア",
+    "No", "エリア", "1法人1事業所", "都内事業所数",
     "法人番号", "法人名", "代表者名", "管理者名", "法人所在地",
     "事業所名", "事業所番号", "事業所所在地",
     "電話番号", "電話番号(整形)", "FAX", "ホームページ",
@@ -276,6 +276,8 @@ def normalize_phone(s):
     """半角数字とハイフンだけの表記に整える。数字は一切変えない。"""
     t = unicodedata.normalize("NFKC", str(s or "")).strip()
     t = _SEP_RE.sub("-", t)
+    # 「直通03-...」のようなラベル文字を除去（数字は落とさない）
+    t = re.sub(r"[^0-9\-]", "", t)
     t = re.sub(r"-{2,}", "-", t).strip("-")
     # 整形で数字が変わっていないことを確認。変わるなら原文を返す（安全側）
     return t if phone_digits(t) == phone_digits(s) else str(s or "").strip()
@@ -382,16 +384,18 @@ def style_sheet(ws, df, with_call_cols):
         dv.add(f"{letter}2:{letter}{nrow + 1}")
 
 
-def write_excel(path, target, tokyo, summary, areas, audit):
+def write_excel(path, full, target, summary, areas, audit):
     used = set()
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        sheets = [("対象リスト", target, True),
-                  ("エリア別集計", summary, False),
-                  ("電話番号_要確認", audit, False)]
-        # 区市町村ごとのシート（対象リストのみ）
+        sheets = [
+            ("架電リスト(全件)", full, True),
+            ("架電リスト(1法人1事業所)", target, True),
+            ("エリア別集計", summary, False),
+            ("電話番号_要確認", audit, False),
+        ]
+        # 区市町村ごとのシートは全件を分割（1法人1事業所は列で絞り込める）
         for area in areas:
-            sheets.append((area, target[target["エリア"] == area], True))
-        sheets.append(("全東京都", tokyo, False))
+            sheets.append((area, full[full["エリア"] == area], True))
 
         for name, df, with_call in sheets:
             sheet = safe_sheet_name(name, used)
@@ -485,7 +489,9 @@ def main():
     n_no = int((hojin_no != "").sum())
     print(f"法人の名寄せキー: 法人番号 {n_no:,}件 / "
           f"法人名＋法人所在地 {len(tokyo) - n_no:,}件")
-    target = tokyo[key.map(key.value_counts()) == 1].copy()
+    counts = key.map(key.value_counts())
+    tokyo["都内事業所数"] = counts.astype(int)
+    tokyo["1法人1事業所"] = counts.eq(1).map({True: "○", False: ""})
 
     # ---- 並べ替え・列整形 ----------------------------------------------
     def finalize(d, with_call):
@@ -505,27 +511,29 @@ def main():
             cols += CALL_COLS
         return d[cols]
 
-    target = finalize(target, True)
-    tokyo_out = finalize(tokyo, False)
+    # 全件を通し番号つきで確定させ、1法人1事業所はその部分集合として切り出す。
+    # こうすることで No がどのシートでも同じ行を指す。
+    full = finalize(tokyo, True)
+    target = full[full["1法人1事業所"] == "○"].copy()
 
-    areas = sorted(target["エリア"].unique(), key=area_sort_key)
+    areas = sorted(full["エリア"].unique(), key=area_sort_key)
     summary = (
         pd.DataFrame({"エリア": areas})
         .assign(
-            対象件数=lambda d: d["エリア"].map(target["エリア"].value_counts()),
-            東京都全件数=lambda d: d["エリア"].map(
-                tokyo_out["エリア"].value_counts()
-            ).fillna(0).astype(int),
+            全件数=lambda d: d["エリア"].map(
+                full["エリア"].value_counts()).fillna(0).astype(int),
+            うち1法人1事業所=lambda d: d["エリア"].map(
+                target["エリア"].value_counts()).fillna(0).astype(int),
         )
     )
 
     # ---- 5. Excel 出力 --------------------------------------------------
-    audit = phone_audit(target)
-    write_excel(OUT_XLSX, target, tokyo_out, summary, areas, audit)
+    audit = phone_audit(full)
+    write_excel(OUT_XLSX, full, target, summary, areas, audit)
 
     # ---- 6. 報告 --------------------------------------------------------
     print()
-    print(f"東京都の居宅介護支援 総事業所数: {len(tokyo_out):,} 件")
+    print(f"東京都の居宅介護支援 総事業所数: {len(full):,} 件")
     print(f"1法人1事業所の件数            : {len(target):,} 件")
     print(f"エリア数                      : {len(areas)} 区市町村")
     print(f"電話番号 要確認                : {len(audit):,} 件"
