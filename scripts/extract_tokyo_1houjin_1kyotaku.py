@@ -30,7 +30,8 @@ OUT_XLSX = "tokyo_1houjin_1kyotaku.xlsx"
 
 # 事業所の基本情報（当初ご指定の並び順を維持し、代表者名・管理者名・エリアを追加）
 BASE_COLS = [
-    "No", "エリア", "1法人1事業所", "都内事業所数",
+    "No", "エリア", "都内1事業所", "全国1事業所",
+    "都内事業所数", "全国事業所数", "事業所タイプ(推定)",
     "法人番号", "法人名", "代表者名", "管理者名", "法人所在地",
     "事業所名", "事業所番号", "事業所所在地",
     "電話番号", "電話番号(整形)", "FAX", "ホームページ",
@@ -260,6 +261,31 @@ def normalize(s):
 
 
 # --------------------------------------------------------------------------
+# 事業所タイプの推定
+# --------------------------------------------------------------------------
+# このデータは全件が居宅介護支援の指定事業所だが、母体が病院や特養で、
+# その一部門として居宅介護支援を持っている事業所も含まれる。
+# 独立系のケアプラン事業所かどうかを事業所名から推定する（あくまで目安）。
+FACILITY_PATTERNS = [
+    ("医療機関併設", r"病院|医院|クリニック|診療所|外科|内科|医師会"),
+    ("訪問看護併設", r"訪問看護"),
+    ("施設併設", r"特別養護|養護老人|老人保健|老健|介護医療院|ケアハウス"
+                r"|有料老人|サービス付き高齢者|ホーム(?!ヘルプ)|苑$|園$|荘$"),
+    ("薬局併設", r"薬局|ドラッグ|薬品"),
+    ("社協・包括", r"地域包括|社会福祉協議会|社協"),
+]
+
+
+def facility_type(name):
+    """事業所名から母体施設を推定する。該当なしは独立系とみなす。"""
+    n = str(name or "")
+    for label, pat in FACILITY_PATTERNS:
+        if re.search(pat, n):
+            return label
+    return "独立系"
+
+
+# --------------------------------------------------------------------------
 # 電話番号
 # --------------------------------------------------------------------------
 # 元データには全角数字・全角ハイフン・丸括弧・読点などの表記ゆれがある。
@@ -384,12 +410,13 @@ def style_sheet(ws, df, with_call_cols):
         dv.add(f"{letter}2:{letter}{nrow + 1}")
 
 
-def write_excel(path, full, target, summary, areas, audit):
+def write_excel(path, full, target, strict, summary, areas, audit):
     used = set()
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         sheets = [
+            ("1法人1事業所(都内)", target, True),
+            ("1法人1事業所(全国)", strict, True),
             ("架電リスト(全件)", full, True),
-            ("架電リスト(1法人1事業所)", target, True),
             ("エリア別集計", summary, False),
             ("電話番号_要確認", audit, False),
         ]
@@ -432,6 +459,11 @@ def main():
     for k in ("電話番号", "FAX", "ホームページ", "利用可能曜日", "指定年月日"):
         out[k] = col(k)
     out["電話番号(整形)"] = out["電話番号"].map(normalize_phone)
+    out["事業所タイプ(推定)"] = out["事業所名"].map(facility_type)
+
+    # 全国での事業所数。東京都で1事業所でも他県に拠点を持つ法人を見分ける。
+    nat = out.loc[out["法人番号"] != "", "法人番号"].value_counts()
+    out["全国事業所数"] = out["法人番号"].map(nat).fillna(0).astype(int)
 
     # 整形で数字が変化していないか全件検証（1件でもあれば異常として止める）
     changed = (out["電話番号"].map(phone_digits)
@@ -491,7 +523,8 @@ def main():
           f"法人名＋法人所在地 {len(tokyo) - n_no:,}件")
     counts = key.map(key.value_counts())
     tokyo["都内事業所数"] = counts.astype(int)
-    tokyo["1法人1事業所"] = counts.eq(1).map({True: "○", False: ""})
+    tokyo["都内1事業所"] = counts.eq(1).map({True: "○", False: ""})
+    tokyo["全国1事業所"] = tokyo["全国事業所数"].eq(1).map({True: "○", False: ""})
 
     # ---- 並べ替え・列整形 ----------------------------------------------
     def finalize(d, with_call):
@@ -514,7 +547,8 @@ def main():
     # 全件を通し番号つきで確定させ、1法人1事業所はその部分集合として切り出す。
     # こうすることで No がどのシートでも同じ行を指す。
     full = finalize(tokyo, True)
-    target = full[full["1法人1事業所"] == "○"].copy()
+    target = full[full["都内1事業所"] == "○"].copy()
+    strict = target[target["全国1事業所"] == "○"].copy()
 
     areas = sorted(full["エリア"].unique(), key=area_sort_key)
     summary = (
@@ -522,19 +556,28 @@ def main():
         .assign(
             全件数=lambda d: d["エリア"].map(
                 full["エリア"].value_counts()).fillna(0).astype(int),
-            うち1法人1事業所=lambda d: d["エリア"].map(
+            都内1事業所=lambda d: d["エリア"].map(
                 target["エリア"].value_counts()).fillna(0).astype(int),
+            全国でも1事業所=lambda d: d["エリア"].map(
+                strict["エリア"].value_counts()).fillna(0).astype(int),
+            うち独立系=lambda d: d["エリア"].map(
+                strict[strict["事業所タイプ(推定)"] == "独立系"]["エリア"]
+                .value_counts()).fillna(0).astype(int),
         )
     )
 
     # ---- 5. Excel 出力 --------------------------------------------------
     audit = phone_audit(full)
-    write_excel(OUT_XLSX, full, target, summary, areas, audit)
+    write_excel(OUT_XLSX, full, target, strict, summary, areas, audit)
 
     # ---- 6. 報告 --------------------------------------------------------
     print()
     print(f"東京都の居宅介護支援 総事業所数: {len(full):,} 件")
-    print(f"1法人1事業所の件数            : {len(target):,} 件")
+    print(f"1法人1事業所の件数(都内基準)   : {len(target):,} 件")
+    print(f"  うち全国でも1事業所          : {len(strict):,} 件")
+    print(f"  うち独立系(併設でない)と推定  : "
+          f"{int((strict['事業所タイプ(推定)'] == '独立系').sum()):,} 件")
+    print(f"  ※都内1事業所だが他県に拠点あり: {len(target) - len(strict):,} 件")
     print(f"エリア数                      : {len(areas)} 区市町村")
     print(f"電話番号 要確認                : {len(audit):,} 件"
           f"（数字自体の誤りではなく表記ゆれ等）")
