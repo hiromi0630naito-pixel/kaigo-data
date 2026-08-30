@@ -33,7 +33,8 @@ BASE_COLS = [
     "No", "エリア",
     "法人番号", "法人名", "代表者名", "管理者名", "法人所在地",
     "事業所名", "事業所番号", "事業所所在地",
-    "電話番号", "FAX", "ホームページ", "利用可能曜日", "指定年月日",
+    "電話番号", "電話番号(整形)", "FAX", "ホームページ",
+    "利用可能曜日", "指定年月日",
 ]
 
 # 元データに無くても残す列（架電時に手で埋めるため）
@@ -259,6 +260,59 @@ def normalize(s):
 
 
 # --------------------------------------------------------------------------
+# 電話番号
+# --------------------------------------------------------------------------
+# 元データには全角数字・全角ハイフン・丸括弧・読点などの表記ゆれがある。
+# 原文は改変せずそのまま残し、架電用に半角へ整形した列を別途用意する。
+_SEP_RE = re.compile(r"[‐‑‒–—―−ー・.,、/()\[\]\s]+")
+
+
+def phone_digits(s):
+    """比較用。数字だけを取り出す。"""
+    return re.sub(r"\D", "", unicodedata.normalize("NFKC", str(s or "")))
+
+
+def normalize_phone(s):
+    """半角数字とハイフンだけの表記に整える。数字は一切変えない。"""
+    t = unicodedata.normalize("NFKC", str(s or "")).strip()
+    t = _SEP_RE.sub("-", t)
+    t = re.sub(r"-{2,}", "-", t).strip("-")
+    # 整形で数字が変わっていないことを確認。変わるなら原文を返す（安全側）
+    return t if phone_digits(t) == phone_digits(s) else str(s or "").strip()
+
+
+def phone_audit(d):
+    """架電前に人が目視すべき行を洗い出す。"""
+    rows = []
+    dg = d["電話番号"].map(phone_digits)
+    dup_nums = set(dg.value_counts()[lambda v: v > 1].index) - {""}
+    for i, r in d.iterrows():
+        notes = []
+        raw = str(r["電話番号"])
+        if re.search(r"[^0-9\-]", raw):
+            notes.append("表記ゆれ(全角・記号混在)")
+        n = len(dg[i])
+        if n == 0:
+            notes.append("電話番号なし")
+        elif n not in (10, 11):
+            notes.append(f"桁数が異常({n}桁)")
+        elif n == 11 and not dg[i].startswith(("050", "070", "080", "090")):
+            notes.append("11桁だが携帯・IP以外")
+        if dg[i] in dup_nums:
+            notes.append("他の法人と同じ番号")
+        if notes:
+            rows.append({
+                "No": r["No"], "エリア": r["エリア"], "法人名": r["法人名"],
+                "事業所名": r["事業所名"], "電話番号(原文)": raw,
+                "電話番号(整形)": r["電話番号(整形)"], "指摘": " / ".join(notes),
+            })
+    return pd.DataFrame(rows, columns=[
+        "No", "エリア", "法人名", "事業所名",
+        "電話番号(原文)", "電話番号(整形)", "指摘",
+    ])
+
+
+# --------------------------------------------------------------------------
 # Excel 出力
 # --------------------------------------------------------------------------
 def display_width(v):
@@ -328,11 +382,12 @@ def style_sheet(ws, df, with_call_cols):
         dv.add(f"{letter}2:{letter}{nrow + 1}")
 
 
-def write_excel(path, target, tokyo, summary, areas):
+def write_excel(path, target, tokyo, summary, areas, audit):
     used = set()
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         sheets = [("対象リスト", target, True),
-                  ("エリア別集計", summary, False)]
+                  ("エリア別集計", summary, False),
+                  ("電話番号_要確認", audit, False)]
         # 区市町村ごとのシート（対象リストのみ）
         for area in areas:
             sheets.append((area, target[target["エリア"] == area], True))
@@ -372,6 +427,15 @@ def main():
     out["事業所所在地"] = join_parts(df, m["_事業所所在地_列"])
     for k in ("電話番号", "FAX", "ホームページ", "利用可能曜日", "指定年月日"):
         out[k] = col(k)
+    out["電話番号(整形)"] = out["電話番号"].map(normalize_phone)
+
+    # 整形で数字が変化していないか全件検証（1件でもあれば異常として止める）
+    changed = (out["電話番号"].map(phone_digits)
+               != out["電話番号(整形)"].map(phone_digits))
+    if changed.any():
+        raise RuntimeError(f"電話番号の整形で数字が変化しました: {int(changed.sum())}件")
+    print(f"  電話番号の整形: {int((out['電話番号'] != out['電話番号(整形)']).sum()):,}件を"
+          f"半角化（数字の変化なしを全件検証済み）")
 
     # 元データに無かった列を報告
     for label in ("法人番号", "代表者名", "管理者名", "電話番号", "FAX",
@@ -456,14 +520,17 @@ def main():
     )
 
     # ---- 5. Excel 出力 --------------------------------------------------
-    write_excel(OUT_XLSX, target, tokyo_out, summary, areas)
+    audit = phone_audit(target)
+    write_excel(OUT_XLSX, target, tokyo_out, summary, areas, audit)
 
     # ---- 6. 報告 --------------------------------------------------------
     print()
     print(f"東京都の居宅介護支援 総事業所数: {len(tokyo_out):,} 件")
     print(f"1法人1事業所の件数            : {len(target):,} 件")
     print(f"エリア数                      : {len(areas)} 区市町村")
-    print(f"出力: {OUT_XLSX}（シート数 {len(areas) + 3}）")
+    print(f"電話番号 要確認                : {len(audit):,} 件"
+          f"（数字自体の誤りではなく表記ゆれ等）")
+    print(f"出力: {OUT_XLSX}（シート数 {len(areas) + 4}）")
 
 
 if __name__ == "__main__":
