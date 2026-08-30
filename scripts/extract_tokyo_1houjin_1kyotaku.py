@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 厚労省「介護サービス情報公表システム」オープンデータ（居宅介護支援・全国版）から
-東京都内に居宅介護支援事業所を1件だけ持つ法人を抽出し、Excelを生成する。
+東京都内に居宅介護支援事業所を1件だけ持つ法人を抽出し、架電リスト用Excelを生成する。
 
 使い方:
     python3 scripts/extract_tokyo_1houjin_1kyotaku.py [CSVパス]
@@ -17,7 +17,9 @@ import sys
 import unicodedata
 
 import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 CSV_URL = (
     "https://www.mhlw.go.jp/content/12300000/"
@@ -26,10 +28,32 @@ CSV_URL = (
 DEFAULT_CSV = "jigyosho_430_all.csv"
 OUT_XLSX = "tokyo_1houjin_1kyotaku.xlsx"
 
-OUT_COLS = [
-    "法人名", "法人所在地", "事業所名", "事業所番号",
-    "事業所所在地", "電話番号", "FAX", "ホームページ", "指定年月日",
+# 事業所の基本情報（当初ご指定の並び順を維持し、代表者名・管理者名・エリアを追加）
+BASE_COLS = [
+    "No", "エリア",
+    "法人名", "代表者名", "管理者名", "法人所在地",
+    "事業所名", "事業所番号", "事業所所在地",
+    "電話番号", "FAX", "ホームページ", "指定年月日",
 ]
+
+# 架電時に記入する項目（空欄で出力）
+CALL_COLS = [
+    "架電状況", "架電日", "架電回数", "担当者", "対応者(役職・氏名)",
+    "見込み度", "通話メモ", "次回アクション", "次回架電予定日", "備考",
+]
+
+STATUS_CHOICES = [
+    "未着手", "アポ獲得", "追客中", "再架電", "不在", "折り返し待ち",
+    "受付ブロック", "興味なし", "番号違い", "対象外",
+]
+RANK_CHOICES = ["A(即アポ)", "B(見込みあり)", "C(長期)", "D(見込み薄)"]
+
+# 幅を広めに取りたい入力欄
+WIDE_COLS = {"通話メモ", "次回アクション", "備考"}
+
+HEADER_FILL_BASE = PatternFill("solid", fgColor="1F4E78")   # 濃紺: 基本情報
+HEADER_FILL_CALL = PatternFill("solid", fgColor="C55A11")   # 橙  : 架電記入欄
+HEADER_FONT = Font(color="FFFFFF", bold=True)
 
 
 # --------------------------------------------------------------------------
@@ -39,9 +63,7 @@ def ensure_csv(path):
     if os.path.exists(path):
         return path
     print(f"ダウンロード中: {CSV_URL}")
-    subprocess.run(
-        ["curl", "-sSL", "--fail", "-o", path, CSV_URL], check=True
-    )
+    subprocess.run(["curl", "-sSL", "--fail", "-o", path, CSV_URL], check=True)
     return path
 
 
@@ -65,27 +87,24 @@ def load_csv(path):
         try:
             header_row = find_header_row(path, enc)
             df = pd.read_csv(
-                path,
-                encoding=enc,
-                skiprows=header_row,
-                dtype=str,
-                low_memory=False,
-                on_bad_lines="skip",
+                path, encoding=enc, skiprows=header_row,
+                dtype=str, low_memory=False, on_bad_lines="skip",
             )
             print(f"読み込み成功: encoding={enc}, 見出し行={header_row}, "
                   f"{len(df):,}行 x {len(df.columns)}列")
             return df
         except (UnicodeDecodeError, UnicodeError) as e:
             last_err = e
-            continue
     raise RuntimeError(f"cp932 / utf-8-sig いずれでも読めませんでした: {last_err}")
 
 
 # --------------------------------------------------------------------------
 # 列名の解決（オープンデータは年度で列名が揺れるため部分一致で探す）
 # --------------------------------------------------------------------------
+KANA_EXCL = (r"かな", r"カナ", r"ｶﾅ", r"フリガナ", r"ふりがな")
+
+
 def pick(cols, patterns, exclude=()):
-    """patterns を順に走査し、最初にマッチした列名を返す。無ければ None。"""
     for pat in patterns:
         for c in cols:
             name = str(c)
@@ -97,7 +116,6 @@ def pick(cols, patterns, exclude=()):
 
 
 def pick_all(cols, pattern, exclude=()):
-    """pattern にマッチする列を出現順に全部返す。"""
     return [
         c for c in cols
         if re.search(pattern, str(c))
@@ -115,9 +133,6 @@ def join_parts(df, cols):
     return s.str.strip()
 
 
-KANA_EXCL = (r"かな", r"カナ", r"ｶﾅ", r"フリガナ", r"ふりがな")
-
-
 def resolve_columns(df):
     cols = list(df.columns)
     m = {}
@@ -125,9 +140,20 @@ def resolve_columns(df):
     m["法人名"] = pick(
         cols, [r"法人.*名称", r"法人名", r"設置者.*名"], exclude=KANA_EXCL
     )
-    m["事業所名"] = pick(
-        cols, [r"事業所.*名称", r"事業所名"], exclude=KANA_EXCL
+    # 代表者名: 「法人代表者」「代表者の氏名」「代表者名」等の揺れを吸収
+    m["代表者名"] = pick(
+        cols,
+        [r"法人.*代表者.*氏名", r"代表者.*氏名", r"法人.*代表者名",
+         r"代表者名", r"代表者"],
+        exclude=KANA_EXCL + (r"職名", r"役職"),
     )
+    # 管理者名: 架電時の取次先として有用なので拾えれば入れる
+    m["管理者名"] = pick(
+        cols,
+        [r"管理者.*氏名", r"管理者名", r"事業所.*管理者"],
+        exclude=KANA_EXCL + (r"職名", r"役職", r"経歴"),
+    )
+    m["事業所名"] = pick(cols, [r"事業所.*名称", r"事業所名"], exclude=KANA_EXCL)
     m["事業所番号"] = pick(cols, [r"事業所番号", r"事業所.*番号"])
     m["電話番号"] = pick(cols, [r"事業所.*電話", r"電話番号", r"電話"])
     m["FAX"] = pick(cols, [r"事業所.*FAX", r"FAX", r"ＦＡＸ", r"ファクシミリ"])
@@ -135,36 +161,63 @@ def resolve_columns(df):
         cols, [r"ホームページ", r"URL", r"ＵＲＬ", r"ウェブ", r"ＨＰ"]
     )
     m["指定年月日"] = pick(
-        cols,
-        [r"指定年月日", r"指定.*年月日", r"指定.*更新.*年月日"],
+        cols, [r"指定年月日", r"指定.*年月日", r"指定.*更新.*年月日"],
         exclude=(r"開始", r"休止", r"廃止", r"失効"),
     )
 
-    # 住所は分割列を連結（無ければ単一列）
-    houjin_addr = pick_all(
-        cols, r"法人所在地", exclude=KANA_EXCL + (r"コード",)
-    )
+    houjin_addr = pick_all(cols, r"法人所在地", exclude=KANA_EXCL + (r"コード",))
     if not houjin_addr:
         c = pick(cols, [r"法人.*所在地", r"法人.*住所"], exclude=KANA_EXCL)
         houjin_addr = [c] if c else []
     m["_法人所在地_列"] = houjin_addr
 
-    jigyo_addr = pick_all(
-        cols, r"事業所所在地", exclude=KANA_EXCL + (r"コード",)
-    )
+    jigyo_addr = pick_all(cols, r"事業所所在地", exclude=KANA_EXCL + (r"コード",))
     if not jigyo_addr:
         c = pick(cols, [r"事業所.*所在地", r"事業所.*住所", r"所在地"],
                  exclude=KANA_EXCL + (r"法人", r"コード"))
         jigyo_addr = [c] if c else []
     m["_事業所所在地_列"] = jigyo_addr
 
-    # 都道府県列（あれば絞り込みに使う）
     m["_都道府県"] = pick(
         cols,
         [r"事業所所在地.*都道府県", r"^都道府県$", r"都道府県名", r"都道府県"],
         exclude=(r"コード", r"法人"),
     )
+    # エリア（区市町村）専用列があれば最優先で使う
+    m["_市区町村"] = pick(
+        cols,
+        [r"事業所所在地.*市区町村", r"事業所所在地.*市町村", r"^市区町村$"],
+        exclude=(r"コード", r"法人"),
+    )
     return m
+
+
+# --------------------------------------------------------------------------
+# エリア（区市町村）の抽出
+# --------------------------------------------------------------------------
+def area_from_address(addr):
+    """住所文字列から区市町村名を切り出す。専用列が無い場合のフォールバック。"""
+    s = str(addr or "").strip()
+    s = re.sub(r"^東京都", "", s)
+    if "郡" in s:                      # 西多摩郡奥多摩町 -> 奥多摩町
+        s = s.split("郡", 1)[1]
+    # 「区」「市」を先に見る。非貪欲なので武蔵村山市を「武蔵村」で切らない
+    for pat in (r"^(.+?[区市])", r"^(.+?[町村])"):
+        mo = re.match(pat, s)
+        if mo:
+            return mo.group(1)
+    return "不明"
+
+
+def area_sort_key(name):
+    """区 → 市 → 町村 → 不明 の順に並べる。"""
+    if name.endswith("区"):
+        return (0, name)
+    if name.endswith("市"):
+        return (1, name)
+    if name.endswith(("町", "村")):
+        return (2, name)
+    return (3, name)
 
 
 # --------------------------------------------------------------------------
@@ -179,12 +232,8 @@ def normalize(s):
     """全角英数記号を半角化し、空白（全角含む）をすべて除去する。"""
     if s is None or (isinstance(s, float) and pd.isna(s)):
         return ""
-    s = str(s)
-    s = unicodedata.normalize("NFKC", s)
-    s = s.translate(_FULL2HALF)
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("　", "")
-    return s
+    s = unicodedata.normalize("NFKC", str(s)).translate(_FULL2HALF)
+    return re.sub(r"\s+", "", s).replace("　", "")
 
 
 # --------------------------------------------------------------------------
@@ -192,35 +241,91 @@ def normalize(s):
 # --------------------------------------------------------------------------
 def display_width(v):
     """日本語を2、半角を1として概算幅を出す。"""
-    w = 0
-    for ch in str(v):
-        w += 2 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 1
-    return w
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 1
+        for ch in str(v)
+    )
 
 
-def write_excel(path, target_df, all_df):
+def safe_sheet_name(name, used):
+    """Excelのシート名制約（31文字・記号禁止・重複不可）に合わせる。"""
+    s = re.sub(r"[\[\]:*?/\\]", "", str(name))[:31] or "シート"
+    base, i = s, 2
+    while s in used:
+        suffix = f"_{i}"
+        s = base[: 31 - len(suffix)] + suffix
+        i += 1
+    used.add(s)
+    return s
+
+
+def style_sheet(ws, df, with_call_cols):
+    """見出し装飾・1行目固定・オートフィルタ・列幅・入力規則をまとめて適用。"""
+    ncol = len(df.columns)
+    nrow = len(df)
+
+    for i, col in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=i)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL_CALL if col in CALL_COLS else HEADER_FILL_BASE
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        if col in CALL_COLS:
+            # 入力欄は中身が空なので見出し幅＋余白で決める
+            width = max(display_width(col) + 4, 16)
+            if col in WIDE_COLS:
+                width = 30
+        else:
+            widths = [display_width(col)]
+            widths += [display_width(v) for v in df[col].head(2000)]
+            width = min(max(widths) + 2, 60)
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    ws.freeze_panes = "A2"                                  # 1行目固定
+    if nrow:
+        ws.auto_filter.ref = f"A1:{get_column_letter(ncol)}{nrow + 1}"
+
+    if not (with_call_cols and nrow):
+        return
+
+    # 架電状況・見込み度にプルダウンを設定
+    for col_name, choices in (
+        ("架電状況", STATUS_CHOICES), ("見込み度", RANK_CHOICES),
+    ):
+        if col_name not in df.columns:
+            continue
+        idx = list(df.columns).index(col_name) + 1
+        letter = get_column_letter(idx)
+        dv = DataValidation(
+            type="list",
+            formula1='"' + ",".join(choices) + '"',
+            allow_blank=True,
+            showDropDown=False,   # False で「ドロップダウンを表示する」がON
+        )
+        ws.add_data_validation(dv)
+        dv.add(f"{letter}2:{letter}{nrow + 1}")
+
+
+def write_excel(path, target, tokyo, summary, areas):
+    used = set()
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        target_df.to_excel(writer, sheet_name="対象リスト", index=False)
-        all_df.to_excel(writer, sheet_name="全東京都", index=False)
+        sheets = [("対象リスト", target, True),
+                  ("エリア別集計", summary, False)]
+        # 区市町村ごとのシート（対象リストのみ）
+        for area in areas:
+            sheets.append((area, target[target["エリア"] == area], True))
+        sheets.append(("全東京都", tokyo, False))
 
-        for sheet_name, df in (("対象リスト", target_df), ("全東京都", all_df)):
-            ws = writer.sheets[sheet_name]
-            ws.freeze_panes = "A2"  # 1行目固定
-            for i, col in enumerate(df.columns, start=1):
-                widths = [display_width(col)]
-                # 全件走査は重いので先頭2000行で概算
-                widths += [display_width(v) for v in df[col].head(2000)]
-                ws.column_dimensions[get_column_letter(i)].width = min(
-                    max(widths) + 2, 60
-                )
+        for name, df, with_call in sheets:
+            sheet = safe_sheet_name(name, used)
+            df.to_excel(writer, sheet_name=sheet, index=False)
+            style_sheet(writer.sheets[sheet], df, with_call)
 
 
 # --------------------------------------------------------------------------
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
-    csv_path = ensure_csv(csv_path)
-
-    df = load_csv(csv_path)
+    df = load_csv(ensure_csv(csv_path))
     m = resolve_columns(df)
 
     missing = [k for k in ("法人名", "事業所名") if not m.get(k)]
@@ -229,18 +334,30 @@ def main():
             f"必須列が見つかりません: {missing}\n列一覧: {list(df.columns)}"
         )
 
+    def col(key):
+        c = m.get(key)
+        return (df[c].fillna("").astype(str).str.strip()
+                if c else pd.Series([""] * len(df), index=df.index))
+
     out = pd.DataFrame(index=df.index)
-    out["法人名"] = df[m["法人名"]].fillna("").astype(str).str.strip()
+    out["法人名"] = col("法人名")
+    out["代表者名"] = col("代表者名")
+    out["管理者名"] = col("管理者名")
     out["法人所在地"] = join_parts(df, m["_法人所在地_列"])
-    out["事業所名"] = df[m["事業所名"]].fillna("").astype(str).str.strip()
-    for key in ("事業所番号", "電話番号", "FAX", "ホームページ", "指定年月日"):
-        col = m.get(key)
-        out[key] = (
-            df[col].fillna("").astype(str).str.strip()
-            if col else ""
-        )
+    out["事業所名"] = col("事業所名")
+    out["事業所番号"] = col("事業所番号")
     out["事業所所在地"] = join_parts(df, m["_事業所所在地_列"])
-    out = out[OUT_COLS]
+    for k in ("電話番号", "FAX", "ホームページ", "指定年月日"):
+        out[k] = col(k)
+
+    # 元データに無かった列を報告
+    for label in ("代表者名", "管理者名", "電話番号", "FAX",
+                  "ホームページ", "指定年月日"):
+        if not m.get(label):
+            print(f"  ※ 注意: 「{label}」に対応する列が元データに見つからず、"
+                  f"空欄で出力します")
+        else:
+            print(f"  {label:<6} <- 元CSV列「{m[label]}」")
 
     # ---- 3. 東京都に絞り込み -------------------------------------------
     if m["_都道府県"]:
@@ -250,26 +367,65 @@ def main():
     else:
         mask = out["事業所所在地"].str.startswith("東京都")
         how = "事業所所在地の先頭一致"
-    tokyo = out[mask].reset_index(drop=True)
+    tokyo = out[mask].copy()
     print(f"東京都の絞り込み方法: {how}")
 
+    # ---- エリア（区市町村） --------------------------------------------
+    if m["_市区町村"]:
+        tokyo["エリア"] = (
+            df.loc[tokyo.index, m["_市区町村"]].fillna("").astype(str).str.strip()
+        )
+        tokyo.loc[tokyo["エリア"] == "", "エリア"] = (
+            tokyo.loc[tokyo["エリア"] == "", "事業所所在地"].map(area_from_address)
+        )
+        # 「西多摩郡奥多摩町」→「奥多摩町」に揃える（住所切り出し側と統一）
+        tokyo["エリア"] = tokyo["エリア"].str.replace(r"^.*郡", "", regex=True)
+        print(f'エリアの取得元: 市区町村列「{m["_市区町村"]}」')
+    else:
+        tokyo["エリア"] = tokyo["事業所所在地"].map(area_from_address)
+        print("エリアの取得元: 事業所所在地から切り出し")
+
     # ---- 4. 法人名＋法人所在地でグルーピング ---------------------------
-    key = (
-        tokyo["法人名"].map(normalize)
-        + "|"
-        + tokyo["法人所在地"].map(normalize)
+    key = tokyo["法人名"].map(normalize) + "|" + tokyo["法人所在地"].map(normalize)
+    target = tokyo[key.map(key.value_counts()) == 1].copy()
+
+    # ---- 並べ替え・列整形 ----------------------------------------------
+    def finalize(d, with_call):
+        d = d.copy()
+        d["_k"] = d["エリア"].map(area_sort_key)
+        d = d.sort_values(["_k", "法人名", "事業所名"]).drop(columns="_k")
+        d = d.reset_index(drop=True)
+        d.insert(0, "No", range(1, len(d) + 1))
+        cols = list(BASE_COLS)
+        if with_call:
+            for c in CALL_COLS:
+                d[c] = ""
+            cols += CALL_COLS
+        return d[cols]
+
+    target = finalize(target, True)
+    tokyo_out = finalize(tokyo, False)
+
+    areas = sorted(target["エリア"].unique(), key=area_sort_key)
+    summary = (
+        pd.DataFrame({"エリア": areas})
+        .assign(
+            対象件数=lambda d: d["エリア"].map(target["エリア"].value_counts()),
+            東京都全件数=lambda d: d["エリア"].map(
+                tokyo_out["エリア"].value_counts()
+            ).fillna(0).astype(int),
+        )
     )
-    counts = key.map(key.value_counts())
-    target = tokyo[counts == 1].reset_index(drop=True)
 
     # ---- 5. Excel 出力 --------------------------------------------------
-    write_excel(OUT_XLSX, target, tokyo)
+    write_excel(OUT_XLSX, target, tokyo_out, summary, areas)
 
     # ---- 6. 報告 --------------------------------------------------------
     print()
-    print(f"東京都の居宅介護支援 総事業所数: {len(tokyo):,} 件")
+    print(f"東京都の居宅介護支援 総事業所数: {len(tokyo_out):,} 件")
     print(f"1法人1事業所の件数            : {len(target):,} 件")
-    print(f"出力: {OUT_XLSX}")
+    print(f"エリア数                      : {len(areas)} 区市町村")
+    print(f"出力: {OUT_XLSX}（シート数 {len(areas) + 3}）")
 
 
 if __name__ == "__main__":
