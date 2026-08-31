@@ -10,12 +10,14 @@
 CSVパス省略時は既定URLからダウンロードを試みる。
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
 import unicodedata
 
+import openpyxl
 import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -768,6 +770,7 @@ def main():
     print(f"電話番号 要確認                : {len(audit):,} 件"
           f"（数字自体の誤りではなく表記ゆれ等）")
     print(f"出力: {OUT_XLSX}")
+    validate_output(call_list, excluded, target)
 
 
 
@@ -1022,6 +1025,77 @@ def write_criteria(ws):
         b.alignment = Alignment(wrap_text=True, vertical="top")
     ws.column_dimensions["A"].width = 26
     ws.column_dimensions["B"].width = 78
+
+
+# --------------------------------------------------------------------------
+# 出力契約の照合
+# --------------------------------------------------------------------------
+# チームが依存する名前（シート名・列名・プルダウンの選択肢）が、こちらの都合で
+# 黙って変わらないようにする。scripts/output_spec.json と食い違ったら停止する。
+# 変更したいときは spec を意図的に編集する。編集は git の差分に必ず現れる。
+SPEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "output_spec.json")
+
+
+def _diff(label, expected, actual, problems):
+    if list(expected) == list(actual):
+        return
+    miss = [x for x in expected if x not in actual]
+    extra = [x for x in actual if x not in expected]
+    detail = []
+    if miss:
+        detail.append("欠けている: " + ", ".join(map(str, miss)))
+    if extra:
+        detail.append("増えている: " + ", ".join(map(str, extra)))
+    if not detail:
+        detail.append("順序が違う")
+    problems.append(f"  {label}\n    " + "\n    ".join(detail))
+
+
+def validate_output(call_list, excluded, target):
+    """出力が契約どおりか照合する。違えば全件まとめて報告して止める。"""
+    if not os.path.exists(SPEC_PATH):
+        print("  ※ output_spec.json が無いため契約の照合をスキップします")
+        return
+    with open(SPEC_PATH, encoding="utf-8") as f:
+        spec = json.load(f)
+    problems = []
+
+    wb = openpyxl.load_workbook(OUT_XLSX, read_only=True)
+    fixed = [n for n in wb.sheetnames if n in spec["固定シート"]]
+    _diff("固定シート", spec["固定シート"], fixed, problems)
+    _diff("架電リストの列", spec["架電リストの列"],
+          list(call_list.columns), problems)
+    _diff("出力ファイル", spec["出力ファイル"],
+          [p for p in spec["出力ファイル"] if os.path.exists(p)], problems)
+
+    for name, choices in spec["プルダウンの選択肢"].items():
+        _diff(f"プルダウン「{name}」", choices, CHOICES.get(name, []), problems)
+
+    # 不変条件
+    inv = spec.get("不変条件", {})
+    if inv.get("架電記入欄は空で出力"):
+        dirty = [c for c in CALL_COLS
+                 if c in call_list.columns
+                 and call_list[c].astype(str).str.strip().ne("").any()]
+        if dirty:
+            problems.append("  架電記入欄に値が入っている: " + ", ".join(dirty))
+    if inv.get("最終リストと除外リストの合計が都内1事業所の件数と一致"):
+        if len(call_list) + len(excluded) != len(target):
+            problems.append(
+                f"  件数が合わない: 最終{len(call_list):,} + 除外{len(excluded):,}"
+                f" != 都内1事業所{len(target):,}")
+
+    if problems:
+        raise RuntimeError(
+            "出力が output_spec.json の契約と違います。\n"
+            + "\n".join(problems)
+            + "\n\n意図した変更なら scripts/output_spec.json を更新してください。"
+              "\nチームが使っている名前を変えることになるので、"
+              "変更前に周知が必要です。"
+        )
+    print(f"  出力契約の照合: OK（シート{len(fixed)} / "
+          f"列{len(call_list.columns)} / プルダウン{len(spec['プルダウンの選択肢'])}）")
 
 
 if __name__ == "__main__":
