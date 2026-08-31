@@ -43,25 +43,50 @@ BASE_COLS = [
 # 元データに無くても残す列（架電時に手で埋めるため）
 KEEP_IF_EMPTY = {"代表者名", "管理者名", "指定年月日"}
 
+# 架電状況。集計でファネルに落とすため、互いに重ならない区分にしている。
+ST_MITAKUSHU = "未着手"
+ST_FUZAI = "不在・話中"          # 誰も出ない
+ST_FUTSU = "番号違い・不通"      # 番号が無効。母数から外す
+ST_BLOCK = "受付ブロック"        # 人は出たが担当に取り次がれない
+ST_TALK = "担当者と会話"         # 担当と話せたがアポには至らず
+ST_ORIKAESHI = "折り返し待ち"
+ST_APO = "アポ獲得"
+ST_KOTOWARI = "見込みなし・断り"
+ST_TAISHOGAI = "対象外"          # サービス対象外。母数から外す
+
+STATUS_ALL = [ST_MITAKUSHU, ST_FUZAI, ST_FUTSU, ST_BLOCK, ST_TALK,
+              ST_ORIKAESHI, ST_APO, ST_KOTOWARI, ST_TAISHOGAI]
+# 人につながった
+ST_CONNECTED = [ST_BLOCK, ST_TALK, ST_ORIKAESHI, ST_APO, ST_KOTOWARI]
+# 担当者まで到達した（受付で止まらなかった）
+ST_REACHED = [ST_TALK, ST_ORIKAESHI, ST_APO, ST_KOTOWARI]
+# 母数から除く（かけても評価できない相手）
+ST_INVALID = [ST_FUTSU, ST_TAISHOGAI]
+
+RESULT_JUCHU = "受注"
+RESULT_ALL = ["未実施", "日程調整中", "実施済(検討中)", RESULT_JUCHU, "失注"]
+RESULT_DONE = ["実施済(検討中)", RESULT_JUCHU, "失注"]   # 商談を実施した
+
 # 架電時に記入する項目（空欄で出力）。メモ以外はすべてプルダウンにする。
 CALL_COLS = [
     "記録者", "架電状況", "架電日", "架電回数", "対応者", "見込み度",
-    "次回アクション", "次回架電予定日", "希望時間帯", "通話メモ", "備考",
+    "次回アクション", "次回架電予定日", "希望時間帯",
+    "商談日", "商談結果", "通話メモ", "備考",
 ]
 
 # 列名 -> プルダウンの選択肢
 CHOICES = {
     "記録者": ["しょうちゃん", "さくや", "廣澤"],
-    "架電状況": ["未着手", "アポ獲得", "追客中", "再架電", "不在",
-              "折り返し待ち", "受付ブロック", "興味なし", "番号違い", "対象外"],
+    "架電状況": STATUS_ALL,
     "架電回数": ["1", "2", "3", "4", "5回以上"],
     "対応者": ["代表者", "管理者", "ケアマネ", "事務・受付", "その他", "不明"],
     "見込み度": ["A(即アポ)", "B(見込みあり)", "C(長期)", "D(見込み薄)"],
     "次回アクション": ["再架電", "資料送付", "メール送付", "訪問アポ", "対応不要"],
     "希望時間帯": ["午前", "13-15時", "15-17時", "17時以降", "指定なし"],
+    "商談結果": RESULT_ALL,
 }
 # 日付として入力規則をかける列（プルダウンにはなじまないため）
-DATE_COLS = ["架電日", "次回架電予定日"]
+DATE_COLS = ["架電日", "次回架電予定日", "商談日"]
 
 # 幅を広めに取りたい自由入力欄
 WIDE_COLS = {"通話メモ", "備考"}
@@ -534,6 +559,18 @@ def write_excel(path, full, target, strict, call_list, excluded,
             df.to_excel(writer, sheet_name=sheet, index=False)
             style_sheet(writer.sheets[sheet], df, with_call)
 
+        # 評価用のシート。架電リストの列順が確定した後に作る必要がある。
+        wb = writer.book
+        write_dashboard(wb.create_sheet("評価ダッシュボード"),
+                        list(call_list.columns),
+                        sorted(call_list["エリア"].unique(), key=area_sort_key))
+        write_criteria(wb.create_sheet("評価基準"))
+        # 使う順に並べ替える。架電リスト → ダッシュボード → 評価基準 → その他
+        order = [SHEET_LIST, "評価ダッシュボード", "評価基準"]
+        by_name = {w.title: w for w in wb._sheets}
+        wb._sheets = ([by_name[n] for n in order if n in by_name]
+                      + [w for w in wb._sheets if w.title not in order])
+
 
 # --------------------------------------------------------------------------
 def main():
@@ -730,7 +767,261 @@ def main():
     print(f"エリア数                      : {len(areas)} 区市町村")
     print(f"電話番号 要確認                : {len(audit):,} 件"
           f"（数字自体の誤りではなく表記ゆれ等）")
-    print(f"出力: {OUT_XLSX}（シート数 {len(areas) + 4}）")
+    print(f"出力: {OUT_XLSX}")
+
+
+
+# --------------------------------------------------------------------------
+# 評価ダッシュボード
+# --------------------------------------------------------------------------
+# 架電リストが埋まると自動集計される数式を置く。Excelでも Googleスプレッド
+# シートでも動くよう COUNTIF / COUNTIFS / IFERROR だけで組む。
+SHEET_LIST = "架電リスト(最終)"
+LAST_ROW = 5000
+
+# KPIと初期の判定ライン。実測が貯まったら置き換える前提の仮置き。
+KPI_TARGETS = [
+    ("接続率", 0.50, "有効架電のうち人につながった割合"),
+    ("担当者到達率", 0.60, "接続のうち受付で止まらず担当と話せた割合"),
+    ("アポ率(有効架電比)", 0.03, "架電1本あたりのアポ獲得効率"),
+    ("アポ率(接続比)", 0.06, "つながった相手からアポを取れた割合"),
+    ("商談実施率", 0.80, "アポのうち実際に商談できた割合"),
+    ("受注率(商談比)", 0.20, "商談のうち受注に至った割合"),
+    ("無効リード率(上限)", 0.03, "番号違い・対象外の割合。低いほどよい"),
+]
+MIN_SAMPLE = 100      # セグメントを評価してよい最低架電数
+STRONG_RATIO = 1.3    # 全体平均のこの倍以上なら強化
+WEAK_RATIO = 0.6      # 全体平均のこの倍以下なら縮小検討
+
+
+def _rng(cols, name):
+    """列名から架電リストの絶対参照レンジを作る。"""
+    L = get_column_letter(cols.index(name) + 1)
+    return "'" + SHEET_LIST + "'!$" + L + "$2:$" + L + "$" + str(LAST_ROW)
+
+
+def _any(rng, values):
+    """いずれかの値に一致する件数。COUNTIFの和で組む。"""
+    return "+".join('COUNTIF(' + rng + ',"' + v + '")' for v in values)
+
+
+def _seg_block(label, rng, values, r_st, avg_cell, row0):
+    """セグメント別ブロックの行を返す。row0 はこのブロックの先頭行番号。"""
+    out = [["■ " + label + "別", None, None, None, None, None],
+           ["区分", "架電済", "接続", "アポ", "アポ率", "判定"]]
+    for i, v in enumerate(values):
+        r = row0 + 2 + i
+        conn = "+".join('COUNTIFS(' + rng + ',"' + v + '",' + r_st + ',"' + s + '")'
+                        for s in ST_CONNECTED)
+        out.append([
+            v,
+            '=COUNTIFS(' + rng + ',"' + v + '",' + r_st + ',"<>' + ST_MITAKUSHU + '")',
+            "=" + conn,
+            '=COUNTIFS(' + rng + ',"' + v + '",' + r_st + ',"' + ST_APO + '")',
+            '=IFERROR(D' + str(r) + '/B' + str(r) + ',"")',
+            '=IF(B' + str(r) + '<' + str(MIN_SAMPLE) + ',"サンプル不足",'
+            'IF(E' + str(r) + '="","-",'
+            'IF(E' + str(r) + '>=' + avg_cell + '*' + str(STRONG_RATIO) + ',"強化",'
+            'IF(E' + str(r) + '<=' + avg_cell + '*' + str(WEAK_RATIO) + ',"縮小検討",'
+            '"継続"))))',
+        ])
+    out.append([None] * 6)
+    return out
+
+
+def build_dashboard_rows(cols, areas):
+    """ダッシュボードの全行と、パーセント書式にする行番号を返す。"""
+    st = _rng(cols, "架電状況")
+    rows, pct = [], []
+
+    def add(*vals):
+        rows.append(list(vals) + [None] * (6 - len(vals)))
+
+    add("■ 全体ファネル")
+    add("段階", "件数", "通過率", "説明")
+    add("対象件数", "=COUNTA(" + _rng(cols, "エリア") + ")", None, "リストの総数")
+    add("架電済", "=COUNTA(" + st + ')-COUNTIF(' + st + ',"' + ST_MITAKUSHU + '")',
+        '=IFERROR(B4/B3,"")', "未着手を除く")
+    add("有効架電", "=B4-(" + _any(st, ST_INVALID) + ")",
+        '=IFERROR(B5/B4,"")', "番号違い・対象外を除いた母数")
+    add("接続(人が出た)", "=" + _any(st, ST_CONNECTED),
+        '=IFERROR(B6/B5,"")', "← 接続率")
+    add("担当者到達", "=" + _any(st, ST_REACHED),
+        '=IFERROR(B7/B6,"")', "受付で止まらなかった")
+    add("決裁者と会話",
+        '=COUNTIF(' + _rng(cols, "対応者") + ',"代表者")+COUNTIF('
+        + _rng(cols, "対応者") + ',"管理者")',
+        '=IFERROR(B8/B7,"")', "対応者が代表者・管理者")
+    add("アポ獲得", '=COUNTIF(' + st + ',"' + ST_APO + '")',
+        '=IFERROR(B9/B8,"")', "← ゴール")
+    add("商談実施", "=" + _any(_rng(cols, "商談結果"), RESULT_DONE),
+        '=IFERROR(B10/B9,"")')
+    add("受注", '=COUNTIF(' + _rng(cols, "商談結果") + ',"' + RESULT_JUCHU + '")',
+        '=IFERROR(B11/B10,"")')
+    pct += [4, 5, 6, 7, 8, 9, 10, 11]
+    add()
+
+    add("■ KPIと判定ライン")
+    add("KPI", "実測", "目標(仮)", "判定", "説明")
+    kf = ['=IFERROR(B6/B5,"")', '=IFERROR(B7/B6,"")', '=IFERROR(B9/B5,"")',
+          '=IFERROR(B9/B6,"")', '=IFERROR(B10/B9,"")', '=IFERROR(B11/B10,"")',
+          '=IFERROR((' + _any(st, ST_INVALID) + ')/B4,"")']
+    for i, ((name, target, note), f) in enumerate(zip(KPI_TARGETS, kf)):
+        r = 15 + i
+        if "上限" in name:
+            j = ('=IF(B' + str(r) + '="","未計測",IF(B' + str(r)
+                 + '<=C' + str(r) + ',"OK","要改善"))')
+        else:
+            j = ('=IF(B' + str(r) + '="","未計測",IF(B' + str(r)
+                 + '>=C' + str(r) + ',"OK","未達"))')
+        add(name, f, target, j, note)
+        pct.append(r)
+    APO = "B17"          # アポ率(有効架電比) のセル。セグメント判定の基準
+    add()
+    add("※ 目標値は初期の仮置き。300件ほど架電したら実測で置き換えること。")
+    add()
+
+    # --- セグメント別 ---
+    segs = [
+        ("電話種別", _rng(cols, "電話種別"),
+         ["固定(23区)", "固定(多摩等)", "携帯", "IP電話"]),
+        ("記録者", _rng(cols, "記録者"), CHOICES["記録者"]),
+        ("見込み度", _rng(cols, "見込み度"), CHOICES["見込み度"]),
+        ("対応者", _rng(cols, "対応者"), CHOICES["対応者"]),
+        ("希望時間帯", _rng(cols, "希望時間帯"), CHOICES["希望時間帯"]),
+        ("エリア", _rng(cols, "エリア"), areas),
+    ]
+    for label, rng, vals in segs:
+        row0 = len(rows) + 1
+        block = _seg_block(label, rng, vals, st, APO, row0)
+        for b in block:
+            rows.append(b)
+        pct += [row0 + 2 + i for i in range(len(vals))]
+    return rows, pct
+
+
+def write_dashboard(ws, cols, areas):
+    """評価ダッシュボードのシートを組み立てる。"""
+    rows, pct = build_dashboard_rows(cols, areas)
+    for r, row in enumerate(rows, start=1):
+        for cix, v in enumerate(row, start=1):
+            if v is None:
+                continue
+            cell = ws.cell(r, cix, v)
+            if isinstance(v, str) and v.startswith("■"):
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = HEADER_FILL_BASE
+            elif isinstance(v, str) and v.startswith("※"):
+                cell.font = Font(italic=True, color="808080")
+    for r in pct:
+        for cix in (3, 5):
+            ws.cell(r, cix).number_format = "0.0%"
+        if r <= 21:
+            ws.cell(r, 2).number_format = "0.0%"
+            ws.cell(r, 3).number_format = "0.0%"
+    for r in range(4, 12):
+        ws.cell(r, 2).number_format = "#,##0"
+        ws.cell(r, 3).number_format = "0.0%"
+    widths = [26, 14, 12, 34, 12, 14]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+
+
+CRITERIA_DOC = [
+    ("■ この評価基準の使い方", ""),
+    ("", "架電を始める前に判定ラインを決めておき、"
+         "貯まった実測で毎週見直す。"),
+    ("", "数値は「評価ダッシュボード」シートが自動集計する。"),
+    ("", ""),
+    ("■ 1. 何を測るか（ファネル）", ""),
+    ("対象件数", "リストの総数。分母の起点"),
+    ("架電済", "1回でもかけた件数。未着手を除く"),
+    ("有効架電", "架電済から番号違い・対象外を除く。"
+                "リストの質が悪いと母数が減る"),
+    ("接続", "人が出た件数。時間帯とリストの鮮度で決まる"),
+    ("担当者到達", "受付で止まらず担当と話せた件数。"
+                  "トークの入口の強さ"),
+    ("決裁者と会話", "対応者が代表者・管理者。"
+                    "1法人1事業所を狙う理由がここに出る"),
+    ("アポ獲得", "ゴール。ただし数だけ見ると質が落ちるので受注まで追う"),
+    ("商談実施", "アポのうち実際に会えた件数。ドタキャン率が見える"),
+    ("受注", "最終成果"),
+    ("", ""),
+    ("■ 2. 判定ライン（初期は仮置き）", ""),
+    ("接続率 50%", "下回るなら架電時間帯を見直す。"
+                  "土日祝営業の事業所は平日日中が捕まりにくい"),
+    ("担当者到達率 60%", "下回るなら受付突破のトークが弱い。"
+                        "名乗りと用件の一言目を変える"),
+    ("アポ率(有効架電比) 3%", "全体の効率指標。"
+                            "1アポあたり約33本が目安になる"),
+    ("アポ率(接続比) 6%", "話せた相手を口説けているか。"
+                        "接続率と分けて見ることでボトルネックが特定できる"),
+    ("商談実施率 80%", "下回るならアポの質が低い。"
+                      "その場の勢いだけで取れていないか"),
+    ("受注率(商談比) 20%", "商材とターゲットの適合。"
+                          "低いならリスト条件そのものを疑う"),
+    ("無効リード率 3%以下", "上回るならリストの鮮度に問題。"
+                          "元データの更新を検討"),
+    ("", ""),
+    ("■ 3. いつ判断してよいか", ""),
+    ("最低100件", "セグメントごとに架電100件を超えるまでは判定しない。"),
+    ("", "アポ率が数%の世界なので、"
+         "50件程度の差はほぼ偶然で説明がついてしまう。"),
+    ("全体300件", "全体で300件を超えたら、"
+                 "上の目標値を自分たちの実測値に置き換える。"),
+    ("", ""),
+    ("■ 4. セグメントの打ち切り基準", ""),
+    ("強化", "そのセグメントのアポ率が全体平均の1.3倍以上。"
+            "残りリストの配分を増やす"),
+    ("継続", "全体平均の0.6〜1.3倍。現状維持"),
+    ("縮小検討", "全体平均の0.6倍以下。"
+                "件数が100を超えていれば配分を減らす"),
+    ("サンプル不足", "架電100件未満。判断しない"),
+    ("", ""),
+    ("■ 5. 見るべきセグメント", ""),
+    ("電話種別", "携帯・IP電話は代表直通の可能性が高い。"
+                "固定(23区)との差が出るかが最初の検証点"),
+    ("記録者", "3人の差はトークの差。"
+              "差が出たら勝ちパターンを共有して揃える"),
+    ("見込み度", "A評価がどれだけ受注に化けたか。"
+                "化けないなら見込み度の付け方がずれている"),
+    ("対応者", "誰に当たった時に決まるか。"
+              "受付で粘るべきか切るべきかの判断材料"),
+    ("希望時間帯", "折り返しがどの時間帯に集中するか。"
+                  "翌週の架電計画に反映する"),
+    ("エリア", "地域差。訪問効率とセットで見る"),
+    ("", ""),
+    ("■ 6. 週次で見る順番", ""),
+    ("① ファネルのどこが細いか", "接続→担当到達→アポの通過率を上から見る"),
+    ("② 一番細い段階だけ改善する", "同時に複数を変えると"
+                                  "何が効いたか分からなくなる"),
+    ("③ セグメント判定を更新", "強化・縮小検討の配分を翌週に反映"),
+    ("④ 目標値の見直し", "実測が目標を安定して超えたら目標を上げる"),
+    ("", ""),
+    ("■ 7. 注意", ""),
+    ("アポ数だけ追わない", "アポ率は上がったのに受注率が落ちる、"
+                          "が最もありがちな失敗"),
+    ("1件目の架電で判断しない", "不在が続くのは普通。"
+                              "架電回数と接触率の関係も見る"),
+    ("除外リストを定期的に見る", "併設や他県拠点を切った判断が"
+                                "正しかったか、後から検証できる"),
+]
+
+
+def write_criteria(ws):
+    """評価基準の説明シートを書く。"""
+    ws.cell(1, 1, "評価基準").font = Font(bold=True, size=14)
+    for i, (k, v) in enumerate(CRITERIA_DOC, start=3):
+        a, b = ws.cell(i, 1, k or None), ws.cell(i, 2, v or None)
+        if k.startswith("■"):
+            a.font = Font(bold=True, color="FFFFFF")
+            a.fill = HEADER_FILL_BASE
+        else:
+            a.font = Font(bold=True)
+        b.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 78
 
 
 if __name__ == "__main__":
